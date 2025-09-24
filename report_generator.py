@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
 import config
+from fpdf import FPDF
 
 # --- FUNÇÕES AUXILIARES E DE FORMATAÇÃO (sem alterações) ---
 
@@ -28,6 +29,12 @@ def sanitizar_nome_arquivo(nome):
     nome_ascii = "".join([c for c in nfkd_form if not unicodedata.combining(c)])
     nome_seguro = re.sub(r'[^\w\s-]', '', nome_ascii).strip().replace(' ', '_')
     return nome_seguro
+
+def criar_nome_arquivo_loja(nome_loja):
+    """Cria um nome de arquivo legível, removendo apenas caracteres inválidos."""
+    # Remove caracteres que não são permitidos em nomes de arquivo
+    nome_seguro = re.sub(r'[\\/*?:"<>|]', "", nome_loja)
+    return f"Relatório de Rupturas {nome_seguro}.xlsx"
 
 def get_numero_loja(nome_loja):
     match = re.match(r"^\d+", nome_loja)
@@ -73,39 +80,49 @@ def formatar_excel(caminho_arquivo):
 
 def gerar_relatorios_gerentes(creds, df, pasta_destino, enviar_email_func):
     print("\n--- INICIANDO GERAÇÃO DE RELATÓRIOS POR LOJA ---")
-    df['usuario_tratativa_fmt'] = df['usuario_tratativa'].apply(formatar_nome_de_email)
 
     for loja, email_gerente in config.GERENTES_EMAILS.items():
         print(f"\nProcessando loja: {loja}...")
         df_loja = df[df["loja"] == loja].copy()
+        
         if df_loja.empty:
             print(f"Nenhum dado encontrado para a loja {loja}. Pulando.")
             continue
+
+        categorias_validas = [cat for cat in df_loja["categoria"].unique() if cat and not pd.isna(cat)]
+
+        if not categorias_validas:
+            print(f"Nenhuma categoria válida encontrada para os registros da loja {loja}. Pulando.")
+            continue
             
         destinatario = config.EMAIL_TESTE if config.MODO_TESTE else email_gerente
-        
-        # *** NOVA LÓGICA: Extrai o primeiro nome do gerente para a saudação ***
         nome_gerente = formatar_nome_de_email(email_gerente, apenas_primeiro_nome=True)
         
         total_rupturas = len(df_loja)
+        
+        # --- INÍCIO DA CORREÇÃO ---
+        # Converte strings vazias para nulo, depois preenche.
+        df_loja['tratativa'] = df_loja['tratativa'].replace('', pd.NA)
         df_loja["tratativa"] = df_loja["tratativa"].fillna("Sem Tratativa")
+        # --- FIM DA CORREÇÃO ---
+        
         rupturas_tratadas = len(df_loja[df_loja["tratativa"] != "Sem Tratativa"])
         divergencias = df_loja[df_loja["tratativa"] == "Verificar Estoque (Divergência)"]
+        
         lista_divergencias_html = "<li>Nenhuma divergência apontada.</li>"
         if not divergencias.empty:
             lista_divergencias_html = "".join([f"<li>{row.produto} (Cód: {row.codigo_produto})</li>" for _, row in divergencias.iterrows()])
         
-        # *** ATUALIZADO: Corpo do e-mail com saudação personalizada ***
         corpo_email = f'<html><body><h2>Relatório de Rupturas - {loja}</h2><p>Olá, {nome_gerente},</p><p>Segue o resumo das rupturas identificadas em sua loja:</p><ul><li><b>Total de Rupturas Identificadas:</b> {total_rupturas}</li><li><b>Rupturas com Tratativa:</b> {rupturas_tratadas}</li></ul><hr><h3>Produtos com Tratativa "Verificar Estoque (Divergência)":</h3><ul>{lista_divergencias_html}</ul><hr><p>O relatório completo, com todas as rupturas separadas por categoria, está em anexo.</p><p>Atenciosamente,<br>Equipe Comercial</p></body></html>'
         
-        nome_arquivo = f"Relatorio_Rupturas_{sanitizar_nome_arquivo(loja)}.xlsx"
+        nome_arquivo = criar_nome_arquivo_loja(loja)
         caminho_completo_arquivo = os.path.join(pasta_destino, nome_arquivo)
         
         with pd.ExcelWriter(caminho_completo_arquivo, engine='openpyxl') as writer:
-            colunas_relatorio = ["timestamp", "nome_solicitante", "categoria", "produto", "tempo_ruptura", "tratativa", "usuario_tratativa_fmt", "data_tratativa"]
-            colunas_rename = {"timestamp": "Data Solicitação", "nome_solicitante": "Solicitante", "categoria": "Categoria", "produto": "Produto", "tempo_ruptura": "Tempo de Ruptura", "tratativa": "Tratativa", "usuario_tratativa_fmt": "Usuário Tratativa", "data_tratativa": "Data Tratativa"}
-            categorias_na_loja = df_loja["categoria"].unique()
-            for categoria in categorias_na_loja:
+            colunas_relatorio = ["timestamp", "nome_solicitante", "categoria", "produto", "tempo_ruptura", "tratativa"]
+            colunas_rename = {"timestamp": "Data Solicitação", "nome_solicitante": "Solicitante", "categoria": "Categoria", "produto": "Produto", "tempo_ruptura": "Tempo de Ruptura", "tratativa": "Tratativa"}
+            
+            for categoria in categorias_validas:
                 df_categoria = df_loja[df_loja["categoria"] == categoria]
                 df_final = df_categoria[colunas_relatorio].rename(columns=colunas_rename)
                 df_final.to_excel(writer, sheet_name=sanitizar_nome_arquivo(str(categoria))[:31], index=False)
@@ -155,8 +172,8 @@ def gerar_relatorios_compradores(creds, df, pasta_destino, enviar_email_func):
         with pd.ExcelWriter(caminho_completo_arquivo, engine='openpyxl') as writer:
             pedidos_por_loja = df_categoria.groupby('loja')
             for loja, df_loja in pedidos_por_loja:
-                colunas_relatorio = ["produto", "codigo_produto", "nome_solicitante", "timestamp"]
-                colunas_rename = {"produto": "Produto", "codigo_produto": "Código", "nome_solicitante": "Solicitante", "timestamp": "Data Solicitação"}
+                colunas_relatorio = ["codigo_produto", "produto", "nome_solicitante", "timestamp"]
+                colunas_rename = {"codigo_produto": "Código", "produto": "Produto", "nome_solicitante": "Solicitante", "timestamp": "Data Solicitação"}
                 df_loja_final = df_loja[colunas_relatorio].rename(columns=colunas_rename)
                 df_loja_final.to_excel(writer, sheet_name=sanitizar_nome_arquivo(loja)[:31], index=False)
         
@@ -167,3 +184,75 @@ def gerar_relatorios_compradores(creds, df, pasta_destino, enviar_email_func):
         corpo_email = f'<html><body><h2>Alerta de Pedido de Compra - Categoria: {categoria}</h2><p>Olá, {nome_comprador},</p><p>Segue em anexo a lista de produtos da categoria <b>{categoria}</b> que precisam de pedido de compra, separados por loja.</p><br><p>Atenciosamente,<br>Equipe Comercial</p></body></html>'
         
         enviar_email_func(creds, destinatario, f"Alerta de Compra - {categoria}", corpo_email, caminho_completo_arquivo)
+
+def gerar_relatorio_gerencial_pdf(df, pasta_destino, data_inicio, data_fim):
+    print("\n--- INICIANDO GERAÇÃO DO RELATÓRIO GERENCIAL PDF ---")
+    if df.empty:
+        print("DataFrame vazio. Não é possível gerar o relatório gerencial.")
+        return
+
+    # 1. Agregação de Dados
+    total_solicitacoes = len(df)
+    
+    # --- INÍCIO DA CORREÇÃO ---
+    # Converte strings vazias para nulo, depois preenche.
+    df['tratativa'] = df['tratativa'].replace('', pd.NA)
+    df["tratativa"] = df["tratativa"].fillna("Sem Tratativa")
+    # --- FIM DA CORREÇÃO ---
+    
+    # Análise por Loja
+    solicitacoes_por_loja = df.groupby('loja').size().reset_index(name='total')
+    tratativas_por_loja = df[df['tratativa'] != 'Sem Tratativa'].groupby('loja').size().reset_index(name='tratadas')
+    
+    # Juntando os dados de loja
+    df_lojas = pd.merge(solicitacoes_por_loja, tratativas_por_loja, on='loja', how='left').fillna(0)
+    df_lojas['tratadas'] = df_lojas['tratadas'].astype(int)
+    
+    # Análise por tipo de Tratativa
+    resumo_tratativas = df['tratativa'].value_counts().reset_index()
+    resumo_tratativas.columns = ['tratativa', 'quantidade']
+
+    # 2. Geração do PDF
+    # (O restante da função de gerar o PDF continua o mesmo)
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    
+    pdf.cell(0, 10, "Relatório Gerencial de Rupturas", 0, 1, "C")
+    pdf.set_font("Arial", "", 12)
+    periodo_str = f"Período: {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+    pdf.cell(0, 10, periodo_str, 0, 1, "C")
+    pdf.ln(10)
+    
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, f"Total de Solicitações no Período: {total_solicitacoes}", 0, 1)
+    pdf.ln(5)
+
+    pdf.cell(0, 10, "Desempenho por Loja:", 0, 1)
+    pdf.set_font("Arial", "B", 10)
+    pdf.cell(80, 8, "Loja", 1, 0, "C")
+    pdf.cell(40, 8, "Solicitações", 1, 0, "C")
+    pdf.cell(40, 8, "Tratadas", 1, 1, "C")
+    pdf.set_font("Arial", "", 10)
+    for index, row in df_lojas.iterrows():
+        pdf.cell(80, 8, row['loja'], 1)
+        pdf.cell(40, 8, str(row['total']), 1, 0, "C")
+        pdf.cell(40, 8, str(row['tratadas']), 1, 1, "C")
+    pdf.ln(10)
+    
+    pdf.set_font("Arial", "B", 12)
+    pdf.cell(0, 10, "Resumo por Tipo de Tratativa:", 0, 1)
+    pdf.set_font("Arial", "B", 10)
+    pdf.cell(120, 8, "Tratativa", 1, 0, "C")
+    pdf.cell(40, 8, "Quantidade", 1, 1, "C")
+    pdf.set_font("Arial", "", 10)
+    for index, row in resumo_tratativas.iterrows():
+        pdf.cell(120, 8, row['tratativa'], 1)
+        pdf.cell(40, 8, str(row['quantidade']), 1, 1, "C")
+    
+    nome_arquivo = f"Relatorio_Gerencial_{data_inicio.strftime('%Y%m%d')}_{data_fim.strftime('%Y%m%d')}.pdf"
+    caminho_completo = os.path.join(pasta_destino, nome_arquivo)
+    pdf.output(caminho_completo)
+    print(f"Relatório Gerencial PDF '{caminho_completo}' gerado com sucesso.")
+    
+    return caminho_completo
